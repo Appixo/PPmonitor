@@ -130,67 +130,6 @@ def test_bol_parse_prijsoverzicht_empty():
 
 
 # ---------------------------------------------------------------------------
-# Bol.com — search result fallback parsing
-# ---------------------------------------------------------------------------
-
-BOL_SEARCH_JSON_LD_HTML = """\
-<html><head></head><body>
-<script type="application/ld+json">
-[
-  {
-    "@type": "Product",
-    "productID": "9300000271683065",
-    "name": "Pokemon TCG Perfect Order Booster Pack",
-    "offers": {
-      "@type": "Offer",
-      "price": "6.99",
-      "availability": "https://schema.org/InStock",
-      "seller": {"@type": "Organization", "name": "TBHstore.nl"}
-    }
-  }
-]
-</script>
-<a href="/nl/nl/p/pokemon-tcg-perfect-order-booster/9300000271683065/">Pokemon TCG Perfect Order Booster Pack</a>
-</body></html>
-"""
-
-BOL_SEARCH_NO_JSON_LD_HTML = """\
-<html><body>
-<div class="product-card" data-price="15.99">
-  <a href="/nl/nl/p/pokemon-tcg-boosterpack/9300000271683065/">Pokemon TCG Boosterpack Obsidian Flames</a>
-</div>
-</body></html>
-"""
-
-
-def test_bol_parse_search_result_json_ld():
-    adapter = BolAdapter()
-    data = adapter.parse_search_result(BOL_SEARCH_JSON_LD_HTML, "9300000271683065")
-    assert data is not None
-    assert data.product_id == "9300000271683065"
-    assert data.name == "Pokemon TCG Perfect Order Booster Pack"
-    assert data.price == "6.99"
-    assert data.availability == "InStock"
-    assert data.seller == "TBHstore.nl"
-
-
-def test_bol_parse_search_result_regex_fallback():
-    adapter = BolAdapter()
-    data = adapter.parse_search_result(BOL_SEARCH_NO_JSON_LD_HTML, "9300000271683065")
-    assert data is not None
-    assert data.product_id == "9300000271683065"
-    assert data.name == "Pokemon TCG Boosterpack Obsidian Flames"
-    assert data.price == "15.99"
-    assert data.availability == "Unknown"
-
-
-def test_bol_parse_search_result_not_found():
-    adapter = BolAdapter()
-    data = adapter.parse_search_result("<html><body>No products</body></html>", "9999999999")
-    assert data is None
-
-
-# ---------------------------------------------------------------------------
 # MediaMarkt
 # ---------------------------------------------------------------------------
 

@@ -17,7 +17,6 @@ import logging
 import re
 import time
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
 from curl_cffi import requests as cffi_requests
@@ -119,15 +118,15 @@ async def _ensure_session() -> None:
     if _session_ready:
         return
 
-    # Warmup via search page
+    # Warmup via allowed category page (robots.txt: Allow /*/c/*/*+8299/$)
     try:
         resp = session.get(
-            "https://www.bol.com/nl/nl/s/?searchtext=pokemon+tcg&view=list",
+            "https://www.bol.com/nl/nl/l/pokemon-kaarten/N/8299+16410/",
             timeout=15,
         )
         if resp.status_code == 200 and len(resp.text) > 10000:
             _session_ready = True
-            logger.info("Bol.com session warmed via search")
+            logger.info("Bol.com session warmed via category page")
         else:
             logger.warning("Bol.com warmup: HTTP %d (%d bytes)", resp.status_code, len(resp.text))
     except Exception:
@@ -223,79 +222,6 @@ class BolAdapter(ShopAdapter):
     def parse_category(self, html: str) -> set[str]:
         return set(RE_PRODUCT_ID.findall(html))
 
-    def parse_search_result(self, html: str, product_id: str) -> ProductData | None:
-        """Extract product data from search results page for a specific product ID.
-
-        Search pages are less protected by Akamai than product pages. We try:
-        1. JSON-LD Product blocks (some search pages include them)
-        2. Regex extraction from the HTML around the product card
-        """
-        # Strategy 1: JSON-LD — search pages sometimes embed Product schema
-        from monitor.shops.base import RE_JSON_LD
-        for match in RE_JSON_LD.finditer(html):
-            try:
-                data = json.loads(match.group(1))
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("@type") != "Product":
-                        continue
-                    pid = str(item.get("productID", ""))
-                    if pid == product_id or not pid:
-                        offers = item.get("offers", {})
-                        if isinstance(offers, dict):
-                            price = offers.get("price")
-                            avail = availability_from_schema_url(
-                                offers.get("availability", "")
-                            )
-                            seller_obj = offers.get("seller", {})
-                            seller = seller_obj.get("name") if isinstance(seller_obj, dict) else None
-                        else:
-                            price, avail, seller = None, "Unknown", None
-                        return ProductData(
-                            product_id=product_id,
-                            name=item.get("name"),
-                            price=str(price) if price is not None else None,
-                            availability=avail,
-                            seller=seller,
-                        )
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        # Strategy 2: Find product card by ID and extract nearby text
-        # Look for a link containing the product_id and grab the text as name
-        card_pattern = re.compile(
-            rf'/nl/nl/p/([^"]*?)/{re.escape(product_id)}/[^"]*"[^>]*>([^<]+)',
-        )
-        card_match = card_pattern.search(html)
-        name = card_match.group(2).strip() if card_match else None
-
-        # Extract price near the product card (common patterns)
-        # data-price="12.99" or "priceAmount":"12.99" or class="price" >12,99<
-        price = None
-        if card_match:
-            # Search in a window around the match
-            start = max(0, card_match.start() - 500)
-            end = min(len(html), card_match.end() + 2000)
-            region = html[start:end]
-            price_match = re.search(
-                r'(?:data-price|"priceAmount"|"price")\s*[:=]\s*"?(\d+[.,]\d{2})"?',
-                region,
-            )
-            if price_match:
-                price = price_match.group(1).replace(",", ".")
-
-        if name:
-            return ProductData(
-                product_id=product_id,
-                name=name,
-                price=price,
-                availability="Unknown",  # can't reliably determine from search
-            )
-
-        return None
-
     def build_product_url(self, product_id: str) -> str:
         return f"{self.base_url}/nl/nl/prijsoverzicht/{PRIJSOVERZICHT_SLUG}/{product_id}/"
 
@@ -304,14 +230,15 @@ class BolAdapter(ShopAdapter):
         return f"{self.base_url}/nl/nl/p/-/{product_id}/"
 
     def build_category_urls(self) -> list[str]:
-        """Search pages for discovery (category pages are Remix SPA)."""
+        """Category pages allowed by robots.txt (Allow: /*/c/*/*+8299/$)."""
         return [
-            f"{self.base_url}/nl/nl/s/?searchtext=pokemon+tcg&view=list",
-            f"{self.base_url}/nl/nl/s/?searchtext=pokemon+kaarten+elite+trainer+box&view=list",
+            f"{self.base_url}/nl/nl/l/pokemon-kaarten/N/8299+16410/",
+            f"{self.base_url}/nl/nl/l/pokemon-kaarten/N/8299+16410/?sortering=4",
         ]
 
     def get_search_url(self, term: str) -> str:
-        return f"{self.base_url}/nl/nl/s/?searchtext={quote(term)}&view=list"
+        # Search URLs (/s/) are disallowed by robots.txt — use category instead
+        return f"{self.base_url}/nl/nl/l/pokemon-kaarten/N/8299+16410/"
 
     async def fetch_product(
         self, client: httpx.AsyncClient, url: str
@@ -321,7 +248,6 @@ class BolAdapter(ShopAdapter):
         Strategy order:
         1. Prijsoverzicht page (lightweight, has all signals)
         2. Direct product page (JSON-LD, full data)
-        3. Search fallback (name/price from search results)
         """
         start = time.monotonic()
         await _ensure_session()
@@ -360,21 +286,12 @@ class BolAdapter(ShopAdapter):
                     logger.debug("Direct product page OK for %s", pid)
                     return data
 
-            # Strategy 3: Search fallback
-            if pid:
-                logger.warning("Bol.com pages blocked — trying search fallback for %s", pid)
-                fallback = await self._search_fallback(session, pid)
-                if fallback and fallback.name:
-                    fallback.latency_ms = latency_ms
-                    logger.info("Search fallback succeeded for %s", pid)
-                    return fallback
-
-            # All strategies failed — reset session
+            # Both strategies failed — reset session
             global _session_ready, _session
             _session_ready = False
             _session = None
             raise httpx.HTTPStatusError(
-                "All fetch strategies failed (prijsoverzicht, direct, search)",
+                "All fetch strategies failed (prijsoverzicht, direct)",
                 request=httpx.Request("GET", url),
                 response=httpx.Response(403),
             )
@@ -387,20 +304,6 @@ class BolAdapter(ShopAdapter):
                 request=httpx.Request("GET", url),
                 response=httpx.Response(500),
             ) from exc
-
-    async def _search_fallback(
-        self, session: cffi_requests.Session, product_id: str
-    ) -> ProductData | None:
-        """Search bol.com for a product ID and extract data from results."""
-        search_url = f"{self.base_url}/nl/nl/s/?searchtext={product_id}&view=list"
-        try:
-            resp = session.get(search_url, timeout=15)
-            if resp.status_code != 200 or len(resp.text) < 5000:
-                return None
-            return self.parse_search_result(resp.text, product_id)
-        except Exception:
-            logger.debug("Search fallback failed for %s", product_id)
-            return None
 
     async def fetch_category(
         self, client: httpx.AsyncClient, url: str
@@ -429,35 +332,22 @@ class BolAdapter(ShopAdapter):
         debug["cookies_count"] = len(session.cookies)
         debug["proxy"] = bool(settings.bol_proxy_url)
 
-        # Warmup / search page
-        warmup_url = f"{self.base_url}/nl/nl/s/?searchtext=pokemon+tcg&view=list"
-        try:
-            resp = session.get(warmup_url, timeout=15)
-            debug["warmup_status"] = resp.status_code
-            debug["warmup_body_length"] = len(resp.text)
-            debug["warmup_body_snippet"] = resp.text[:200]
-            debug["warmup_akamai_blocked"] = len(resp.text) < 5000
-            product_ids = self.parse_category(resp.text)
-            debug["warmup_product_ids_found"] = len(product_ids)
-        except Exception as exc:
-            debug["warmup_error"] = f"{type(exc).__name__}: {exc}"
-            product_ids = set()
-
-        # Category page
+        # Category page (robots.txt allowed: /*/c/*/*+8299/$)
         cat_url = self.build_category_urls()[0]
+        debug["category_url"] = cat_url
+        product_ids: set[str] = set()
         try:
             resp = session.get(cat_url, timeout=15)
             debug["category_status"] = resp.status_code
             debug["category_body_length"] = len(resp.text)
-            debug["category_body_snippet"] = resp.text[:500]
+            debug["category_body_snippet"] = resp.text[:200]
             debug["category_akamai_blocked"] = len(resp.text) < 5000
-            cat_ids = self.parse_category(resp.text)
-            debug["category_product_ids_found"] = len(cat_ids)
-            product_ids.update(cat_ids)
+            product_ids = self.parse_category(resp.text)
+            debug["category_product_ids_found"] = len(product_ids)
         except Exception as exc:
             debug["category_error"] = f"{type(exc).__name__}: {exc}"
 
-        # Try prijsoverzicht page first
+        # Test prijsoverzicht + direct product page
         if product_ids:
             pid = next(iter(product_ids))
 
@@ -478,9 +368,8 @@ class BolAdapter(ShopAdapter):
                         debug["prijs_availability"] = data.availability
                         debug["prijs_revision_id"] = data.revision_id
                         debug["prijs_offer_uid"] = data.offer_uid
-                        debug["prijs_purchase_type"] = RE_PURCHASE_TYPE.search(resp.text)
-                        if debug["prijs_purchase_type"]:
-                            debug["prijs_purchase_type"] = debug["prijs_purchase_type"].group(1)
+                        pt_match = RE_PURCHASE_TYPE.search(resp.text)
+                        debug["prijs_purchase_type"] = pt_match.group(1) if pt_match else None
                     else:
                         debug["prijs_parse"] = "failed — no revision_id or price found"
             except Exception as exc:
@@ -496,17 +385,5 @@ class BolAdapter(ShopAdapter):
                 debug["direct_akamai_blocked"] = len(resp.text) < 5000
             except Exception as exc:
                 debug["direct_error"] = f"{type(exc).__name__}: {exc}"
-
-            # Search fallback (for comparison)
-            try:
-                fallback = await self._search_fallback(session, pid)
-                if fallback:
-                    debug["search_fallback"] = "success"
-                    debug["fallback_name"] = fallback.name
-                    debug["fallback_price"] = fallback.price
-                else:
-                    debug["search_fallback"] = "failed"
-            except Exception as exc:
-                debug["search_error"] = f"{type(exc).__name__}: {exc}"
 
         return debug
